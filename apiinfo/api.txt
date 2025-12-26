@@ -1,0 +1,13 @@
+URl: "http://127.0.0.1:5000/api/register_tenant"
+Payload:{
+  "institution_name": "AimorenDigitalSolutions",
+  "admin_username": "Nithin",
+  "admin_password": "Nithinpassword@123"
+}
+
+Response : {
+    "admin_username": "Nithin",
+    "login_instructions": "Use this tenant_id along with the admin username and password to log in.",
+    "message": "Institution 'AimorenDigitalSolutions' registered successfully.",
+    "tenant_id": "758ACA"
+}
