@@ -200,7 +200,9 @@ def register_tenant():
         "username": admin_username,
         "password": hashed_password,
         "role": "admin",
-        "tenant_id": new_tenant_id 
+        "tenant_id": new_tenant_id ,
+        "employee_id":"A01",
+        "is_active":True
     }
 
     try:
@@ -246,6 +248,11 @@ def login():
     if not user:
         return jsonify({'message': 'Login failed: Invalid credentials'}), 401
     
+    if user["role"]=="user" :
+        if user["is_active"]==False:
+            return jsonify({'message': 'Login failed: Old Employee/User'}), 401
+
+
     if bcrypt.check_password_hash(user['password'], auth['password']):
         
         payload = {
@@ -334,7 +341,8 @@ def onboard_employee():
         "contact_email": data.get('contact_email', new_username), # Use username as fallback email
         "reports_to_employee_ids": reports_to_ids,
         "is_active": data.get('is_active', True),
-        "date_added": datetime.now(timezone.utc).isoformat()
+        "date_added": datetime.now(timezone.utc).isoformat(),
+        # "old_employee": False,
     }
     
     # User Login Data
@@ -345,7 +353,8 @@ def onboard_employee():
         "role": new_role,
         "tenant_id": tenant_id,
         "employee_id": employee_id,
-        "is_active": True # Login is active by default upon creation
+        "is_active": True, # Login is active by default upon creation
+        # "old_employee": False
     }
 
     # --- 4. Atomic Database Operation ---
@@ -362,6 +371,7 @@ def onboard_employee():
         return jsonify({
             "message": f"Employee '{data['name']}' and linked User Login created successfully.",
             "employee_id": employee_id,
+            "tenant_id": tenant_id,
             "username": new_username,
             "role": new_role
         }), 201
@@ -425,7 +435,6 @@ def get_single_employee(employee_id):
         app.logger.error(f"Error retrieving employee {employee_id} for tenant {tenant_id}: {e}")
         return jsonify({"error": "Server error retrieving employee details."}), 500 
 
-
 @app.route('/api/employee/<employee_id>', methods=['PUT'])
 @admin_required
 def update_employee(employee_id):
@@ -486,11 +495,8 @@ def delete_employee(employee_id):
     This action is irreversible and should be used with caution.
     """
     # if client is None or employees_collection is None or users_collection is None or attendance_collection is None or leave_requests_collection is None:
-    #     return jsonify({"error": "Database connection not established."}), 500
-
-
-    if client is None or employees_collection is None or users_collection is None or attendance_collection is None:
-        return jsonify({"error": "Database connection not established."}), 500    
+    if client is None or employees_collection is None or users_collection is None or attendance_collection is None :    
+        return jsonify({"error": "Database connection not established."}), 500
 
     tenant_id = request.current_user.get('tenant_id')
     
@@ -609,137 +615,181 @@ def reassign_hierarchy():
 
 # --- Attendance Tracking Routes (Clock In/Out) ---
 
+from bson import ObjectId
+
 @app.route('/api/clock_in', methods=['POST'])
 @token_required 
 def clock_in():
-    """
-    Records an employee's clock-in time, now including their business unit.
-    """
     if client is None or employees_collection is None or attendance_collection is None:
         return jsonify({"error": "Database connection not established."}), 500
     
     data = request.get_json()
-    employee_id = data.get('employee_id')
+    lat = data.get('latitude')
+    lng = data.get('longitude')
+    
+    employee_id = request.current_user.get('employee_id')
     tenant_id = request.current_user.get('tenant_id')
     
-    if not employee_id:
-        return jsonify({'message': 'Missing employee_id'}), 400
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_utc.strftime('%Y-%m-%d')
 
-    # 1. Verify Employee exists and get their business unit
-    employee = employees_collection.find_one({"employee_id": employee_id, "tenant_id": tenant_id})
-    if not employee:
-        app.logger.warning(f"Clock-in failure in tenant {tenant_id}: Employee ID {employee_id} not found.")
-        return jsonify({'message': 'Invalid Employee ID for this institution'}), 404
-    
-    employee_unit = employee.get('business_unit', 'Unassigned') # Fetch the unit
-
-    # 2. Check if the employee is already clocked in
-    latest_log = attendance_collection.find_one({
+    # 1. Look for existing open session
+    open_session = attendance_collection.find_one({
         "employee_id": employee_id, 
         "tenant_id": tenant_id,
         "clock_out_time": {"$exists": False} 
     }, sort=[('clock_in_time', -1)])
 
-    if latest_log:
-        app.logger.warning(f"Clock-in failure: Employee {employee_id} is already clocked in.")
-        return jsonify({'message': 'Employee is already clocked in.'}), 409
+    if open_session:
+        # If they have an open session from a previous day, block them
+        if open_session.get('clock_in_date') != today_str:
+            return jsonify({
+                "message": f"Clock-in blocked. You forgot to clock out on {open_session['clock_in_date']}.",
+                "error_code": "MISSING_CLOCK_OUT",
+                "pending_date": open_session['clock_in_date'],
+                "attendance_id": str(open_session['_id']) # Include ID so they can force close it
+            }), 403 
+        
+        # If already clocked in today, return the existing ID so the app can resume tracking
+        return jsonify({
+            "message": "You are already clocked in for today.",
+            "attendance_id": str(open_session['_id'])
+        }), 200
 
-    # 3. Record Clock-In
-    now_utc = datetime.now(timezone.utc)
+    # 2. Get Employee Profile
+    employee = employees_collection.find_one({"employee_id": employee_id, "tenant_id": tenant_id})
+    unit = employee.get('business_unit', 'Unassigned') if employee else 'Unassigned'
+
+    # 3. Create the Clock-In Record
     log_data = {
         "employee_id": employee_id,
         "tenant_id": tenant_id,
-        "business_unit": employee_unit, # NEW FIELD added to log
+        "business_unit": unit,
+        "clock_in_date": today_str,
         "clock_in_time": now_utc.isoformat(),
-        "status": "IN"
+        "status": "IN",
+        "location_in": {
+            "type": "Point",
+            "coordinates": [lng, lat] 
+        } if lat is not None and lng is not None else None
     }
     
     try:
-        attendance_collection.insert_one(log_data)
-        app.logger.info(f"Employee {employee_id} ({employee_unit}) clocked in at {now_utc.isoformat()}.")
+        # 4. CAPTURE THE ID: result.inserted_id is critical for tracking
+        result = attendance_collection.insert_one(log_data)
+        attendance_id = str(result.inserted_id)
+
         return jsonify({
-            "message": f"{employee['name']} ({employee_unit}) clocked in successfully.",
-            "time": now_utc.isoformat(),
-            "business_unit": employee_unit,
-            "status": "IN"
+            "employee_id": employee_id,
+            "tenant_id": tenant_id,
+            "attendance_id": attendance_id, # <--- NEW: App needs this for /api/tracking/ping
+            "message": "Clock-in successful.",
+            "date": today_str,
+            "time": now_utc.isoformat()
         }), 201
     except Exception as e:
-        app.logger.error(f"Error during clock-in for employee {employee_id}: {e}")
+        app.logger.error(f"Error during clock-in: {e}")
         return jsonify({"error": "Server error during clock-in."}), 500
 
-         
 @app.route('/api/clock_out', methods=['POST'])
 @token_required 
 def clock_out():
-    """
-    Records an employee's clock-out time, updating the last un-clocked-out record.
-    Also calculates the duration of the work session.
-    """
     if client is None or employees_collection is None or attendance_collection is None:
         return jsonify({"error": "Database connection not established."}), 500
     
     data = request.get_json()
-    employee_id = data.get('employee_id')
+    lat = data.get('latitude')
+    lng = data.get('longitude')
+    # NEW: The app should pass the attendance_id to ensure we close the right session
+    attendance_id = data.get('attendance_id') 
+    
+    employee_id = request.current_user.get('employee_id')
     tenant_id = request.current_user.get('tenant_id')
 
-    if not employee_id:
-        return jsonify({'message': 'Missing employee_id'}), 400
-
-    # 1. Verify Employee exists within the tenant
+    # 1. Verify Employee exists
     employee = employees_collection.find_one({"employee_id": employee_id, "tenant_id": tenant_id})
     if not employee:
-        app.logger.warning(f"Clock-out failure: Employee ID {employee_id} not found in tenant {tenant_id}.")
-        return jsonify({'message': 'Invalid Employee ID for this institution'}), 404
+        return jsonify({'message': 'Invalid Employee ID'}), 404
 
-    # 2. Find the latest record that is still "IN" (i.e., missing clock_out_time)
-    log_query = {
-        "employee_id": employee_id, 
-        "tenant_id": tenant_id,
-        "clock_out_time": {"$exists": False} # The key condition: only find open sessions
-    }
-    
-    # Sort by clock_in_time descending to get the most recent open session
-    latest_in_log = attendance_collection.find_one(log_query, sort=[('clock_in_time', -1)])
+    # 2. Target the specific record (Prefer using attendance_id if provided)
+    if attendance_id:
+        query = {"_id": ObjectId(attendance_id), "tenant_id": tenant_id}
+    else:
+        # Fallback to finding the open session if ID is missing
+        query = {"employee_id": employee_id, "tenant_id": tenant_id, "clock_out_time": {"$exists": False}}
+
+    latest_in_log = attendance_collection.find_one(query, sort=[('clock_in_time', -1)])
     
     if not latest_in_log:
-        app.logger.warning(f"Clock-out failure: Employee {employee_id} attempted to clock out but was not clocked in.")
-        return jsonify({'message': 'Employee is not currently clocked in. Cannot clock out.'}), 404
+        return jsonify({'message': 'Active session not found.'}), 404
 
-    # 3. Record Clock-Out
     now_utc = datetime.now(timezone.utc)
     
     try:
-        # Update the found document with the clock-out time and final status
+        # 3. Update the record
         attendance_collection.update_one(
             {"_id": latest_in_log['_id']},
             {"$set": {
+                "clock_out_date": now_utc.strftime('%Y-%m-%d'),
                 "clock_out_time": now_utc.isoformat(),
-                "status": "OUT"
+                "status": "OUT",
+                "location_out": {
+                    "type": "Point",
+                    "coordinates": [lng, lat]
+                } if lat is not None and lng is not None else None
             }}
         )
         
-        # 4. Calculate duration for confirmation
-        # Convert the stored ISO string back to a datetime object with UTC timezone awareness
+        # 4. Calculate duration
         clock_in_time = datetime.fromisoformat(latest_in_log['clock_in_time'].replace('Z', '+00:00'))
         duration = now_utc - clock_in_time
-        
-        total_seconds = duration.total_seconds()
-        hours = int(total_seconds // 3600)
-        minutes = int((total_seconds % 3600) // 60)
-        
-        app.logger.info(f"Employee {employee_id} clocked out at {now_utc.isoformat()}. Duration: {hours}h {minutes}m.")
-        
+        total_seconds = int(duration.total_seconds())
+        hours, minutes = total_seconds // 3600, (total_seconds % 3600) // 60
+
         return jsonify({
-            "message": f"{employee['name']} clocked out successfully.",
-            "time": now_utc.isoformat(),
+            "employee_id": employee_id,
+            "attendance_id": str(latest_in_log['_id']),
+            "message": f"Clocked out successfully.",
             "duration": f"{hours} hours and {minutes} minutes",
-            "status": "OUT",
-            "business_unit": latest_in_log.get('business_unit') # Return the unit from the log
+            "status": "OUT"
         }), 200
-        
     except Exception as e:
-        app.logger.error(f"Error during clock-out for employee {employee_id}: {e}")
+        app.logger.error(f"Error during clock-out: {e}")
         return jsonify({"error": "Server error during clock-out."}), 500
+
+@app.route('/api/attendance/adjust', methods=['POST'])
+@team_required(['hr_team','admin']) # Only HR Approvers or Admins can fix logs
+def adjust_attendance():
+    """
+    Allows HR to manually set a clock-out time for a forgotten session.
+    """
+    if client is None or attendance_collection is None:
+        return jsonify({"error": "Database connection not established."}), 500
+
+    data = request.get_json()
+    record_id = data.get('record_id') # The MongoDB _id or a unique request ID
+    manual_out_time = data.get('clock_out_time') # e.g., "2026-01-01T17:00:00"
+    reason = data.get('reason')
+
+    if not record_id or not manual_out_time:
+        return jsonify({'message': 'Missing record_id or new clock_out_time'}), 400
+
+    try:
+        # Update the record with the manual time and a flag
+        attendance_collection.update_one(
+            {"_id": ObjectId(record_id)},
+            {"$set": {
+                "clock_out_time": manual_out_time,
+                "clock_out_date": manual_out_time.split('T')[0],
+                "status": "MANUALLY_FIXED",
+                "adjustment_note": reason,
+                "adjusted_by": request.current_user['username']
+            }}
+        )
+        
+        return jsonify({"message": "Attendance record adjusted successfully."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500        
 
 # Leave application part
 
@@ -747,120 +797,305 @@ def clock_out():
 @app.route('/api/leave/request', methods=['POST'])
 @token_required
 def submit_leave_request():
-    """
-    Allows an employee to submit a leave request, setting up a multi-step approval array.
-    """
     if client is None or employees_collection is None or leave_requests_collection is None:
         return jsonify({"error": "Database connection not established."}), 500
         
     data = request.get_json()
     tenant_id = request.current_user.get('tenant_id')
-    employee_id = data.get('employee_id') 
+    # Use ID from token instead of body for security
+    employee_id = request.current_user.get('employee_id') 
     
-    if not employee_id:
-        return jsonify({'message': 'Missing employee_id in request.'}), 400
-        
     employee_info = employees_collection.find_one({"employee_id": employee_id, "tenant_id": tenant_id})
     if not employee_info:
-        return jsonify({'message': 'Employee not found in this institution.'}), 404
+        return jsonify({'message': 'Employee profile not found.'}), 404
         
-    # Get the list of required approvers
+    # Get the list of managers
     approver_ids = employee_info.get('reports_to_employee_ids', [])
     if not approver_ids:
-        # If no approver is defined, auto-approve for simplicity, or reject
-        return jsonify({'message': 'No manager defined for this employee. Request rejected (or auto-approved in some systems).'}), 400
+        return jsonify({'message': 'No managers assigned. Please contact HR.'}), 400
 
     required_fields = ['leave_type', 'start_date', 'end_date', 'reason']
     if not all(field in data for field in required_fields):
-        return jsonify({'message': 'Missing required leave details.'}), 400
+        return jsonify({'message': 'Missing leave details (type, dates, or reason).'}), 400
         
     try:
-        request_id = str(uuid.uuid4())
-        
-        # Look up approver names (if possible) for the tracking array
-        approver_details = employees_collection.find({"employee_id": {"$in": approver_ids}}, {"employee_id": 1, "name": 1})
+        # Fetch manager names to make the request readable
+        approver_details = employees_collection.find(
+            {"employee_id": {"$in": approver_ids}}, 
+            {"employee_id": 1, "name": 1}
+        )
         approver_map = {det['employee_id']: det['name'] for det in approver_details}
 
+        # Build the multi-step approval array
         approvals_needed = []
-        for approver_id in approver_ids:
+        for a_id in approver_ids:
             approvals_needed.append({
-                "approver_id": approver_id,
+                "approver_id": a_id,
+                "name": approver_map.get(a_id, "Manager"),
                 "status": "Pending",
-                "name": approver_map.get(approver_id, "Unknown Manager"),
                 "decision_date": None
             })
 
         request_data = {
-            "request_id": request_id,
+            "request_id": str(uuid.uuid4()),
             "tenant_id": tenant_id,
             "employee_id": employee_id,
             "employee_name": employee_info['name'],
+            "business_unit": employee_info.get('business_unit', 'Unassigned'),
             "leave_type": data['leave_type'],
             "start_date": data['start_date'],
             "end_date": data['end_date'],
             "reason": data['reason'],
-            "status": "Pending", # Overall status is Pending until all are approved
-            "approvals_needed": approvals_needed, # NEW ARRAY
+            "status": "Pending",
+            "approvals_needed": approvals_needed,
             "requested_on": datetime.now(timezone.utc).isoformat()
         }
         
         leave_requests_collection.insert_one(request_data)
-        app.logger.info(f"Multi-step leave request {request_id} submitted by {employee_id}. Pending {len(approver_ids)} approvals.")
-        return jsonify({
-            "message": "Leave request submitted successfully for multi-level approval.",
-            "request_id": request_id,
-            "approvers_needed": approver_ids,
-            "status": "Pending"
-        }), 201
+        return jsonify({"message": "Leave request submitted for manager approval.", "request_id": request_data['request_id']}), 201
 
     except Exception as e:
-        app.logger.error(f"Error submitting leave request for {employee_id}: {e}")
+        app.logger.error(f"Leave submission error: {e}")
         return jsonify({"error": "Server error during leave submission."}), 500
 
-# Replace the previous get_pending_leave_requests route with this updated version
 @app.route('/api/leave/pending', methods=['GET'])
 @token_required
 def get_pending_leave_requests():
-    """
-    Retrieves all pending leave requests where the current logged-in user is a required approver.
-    """
-    if client is None or leave_requests_collection is None or employees_collection is None:
+    if client is None or leave_requests_collection is None:
         return jsonify({"error": "Database connection not established."}), 500
 
     tenant_id = request.current_user.get('tenant_id')
-    query = {"tenant_id": tenant_id}
+    user_roles = request.current_user.get('roles', [])
+    current_emp_id = request.current_user.get('employee_id')
+
+    # Base query: only pending requests for this tenant
+    query = {"tenant_id": tenant_id, "status": "Pending"}
     
-    if request.current_user.get('role') != 'admin':
-        # 1. Find the manager's employee_id (Placeholder link)
-        manager_employee_info = employees_collection.find_one({"contact_email": request.current_user.get('username'), "tenant_id": tenant_id})
-        if not manager_employee_info:
-             return jsonify({'message': 'Only designated managers/admins can view approval requests.'}), 403
-            
-        manager_employee_id = manager_employee_info['employee_id']
-        
-        # 2. Query for requests where the manager is an approver AND their specific status is 'Pending'
-        query.update({
-            "status": "Pending",
-            "approvals_needed": {
-                "$elemMatch": {
-                    "approver_id": manager_employee_id,
-                    "status": "Pending"
-                }
+    # Permission Logic
+    is_hr_or_admin = any(role in ['admin', 'hr_manager'] for role in user_roles)
+
+    if not is_hr_or_admin:
+        # If not HR/Admin, show only where current user is a pending approver
+        query["approvals_needed"] = {
+            "$elemMatch": {
+                "approver_id": current_emp_id,
+                "status": "Pending"
             }
-        })
-        app.logger.info(f"Manager {manager_employee_id} viewing their pending requests.")
-    else:
-        # Admin views all pending requests regardless of who the approver is
-        query["status"] = "Pending"
-        app.logger.info(f"Admin viewing all pending leave requests for tenant {tenant_id}.")
+        }
     
     try:
         pending_requests = list(leave_requests_collection.find(query, {'_id': 0}).sort('requested_on', 1))
         return jsonify(pending_requests), 200
         
     except Exception as e:
-        app.logger.error(f"Error retrieving pending leave requests: {e}")
-        return jsonify({"error": "Server error retrieving leave requests."}), 500
+        app.logger.error(f"Error retrieving pending requests: {e}")
+        return jsonify({"error": "Server error."}), 500
+
+@app.route('/api/leave/approve', methods=['POST'])
+@token_required
+def approve_leave_request():
+    """
+    Records a manager's decision for a leave request. 
+    Finalizes the overall status if all required managers have signed off.
+    """
+    if client is None or leave_requests_collection is None:
+        return jsonify({"error": "Database connection not established."}), 500
+
+    data = request.get_json()
+    request_id = data.get('request_id')
+    decision = data.get('decision') # Expecting "Approved" or "Rejected"
+    
+    # Get Manager's identity from JWT
+    current_emp_id = request.current_user.get('employee_id')
+    user_roles = request.current_user.get('roles', [])
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    if not request_id or not decision:
+        return jsonify({"message": "Missing request_id or decision."}), 400
+
+    # 1. Authorization: check if user is HR or Admin (Super-approver rights)
+    is_hr_or_admin = any(role in ['admin', 'hr_team'] for role in user_roles)
+
+    try:
+        # 2. Update the specific manager's entry in the approvals_needed array
+        # We find the request where this specific user is an approver
+        result = leave_requests_collection.update_one(
+            {
+                "request_id": request_id,
+                "approvals_needed.approver_id": current_emp_id
+            },
+            {
+                "$set": {
+                    "approvals_needed.$[elem].status": decision,
+                    "approvals_needed.$[elem].decision_date": now_str
+                }
+            },
+            array_filters=[{"elem.approver_id": current_emp_id}]
+        )
+
+        # If no document was updated, this user isn't a listed manager for this request
+        if result.matched_count == 0 and not is_hr_or_admin:
+            return jsonify({"message": "Forbidden: You are not an authorized approver for this request."}), 403
+
+        # 3. Handle Overall Status
+        updated_req = leave_requests_collection.find_one({"request_id": request_id})
+        
+        # Scenario A: If ANY manager rejects, the whole request is Rejected immediately
+        if decision == "Rejected":
+            leave_requests_collection.update_one(
+                {"request_id": request_id},
+                {"$set": {"status": "Rejected"}}
+            )
+            return jsonify({"message": "Leave request has been Rejected."}), 200
+
+        # Scenario B: Check if EVERY manager in the array has now set status to "Approved"
+        all_approved = all(a['status'] == "Approved" for a in updated_req['approvals_needed'])
+        
+        if all_approved:
+            leave_requests_collection.update_one(
+                {"request_id": request_id},
+                {"$set": {"status": "Approved"}}
+            )
+            return jsonify({"message": "Final approval granted. Leave is now fully Approved."}), 200
+        
+        # Scenario C: Still waiting on other managers
+        return jsonify({"message": f"Step approved. Waiting for remaining managers."}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error in leave approval: {e}")
+        return jsonify({"error": "Server error during approval process."}), 500       
+
+@app.route('/api/tracking/ping', methods=['POST'])
+@token_required
+def location_ping():
+    """
+    Receives periodic GPS coordinates while the user is clocked in.
+    """
+    if client is None or db is None:
+        app.logger.critical("Database connection lost during tracking ping!")
+        return jsonify({"error": "Database connection not established."}), 500
+
+    try:
+        data = request.get_json()
+        lat = data.get('latitude')
+        lng = data.get('longitude')
+        
+        employee_id = request.current_user.get('employee_id')
+        tenant_id = request.current_user.get('tenant_id')
+
+        # Validation: Check if coordinates are present
+        if lat is None or lng is None:
+            app.logger.warning(f"Empty ping received from Employee {employee_id}")
+            return jsonify({"message": "Coordinates missing."}), 400
+
+        # 1. Verify the employee is currently Clocked IN
+        active_session = attendance_collection.find_one({
+            "employee_id": employee_id,
+            "tenant_id": tenant_id,
+            "clock_out_time": {"$exists": False}
+        })
+
+        if not active_session:
+            app.logger.info(f"Ping rejected: Employee {employee_id} is not clocked in.")
+            return jsonify({"message": "Tracking stopped: No active clock-in session."}), 403
+
+        # 2. Record the movement ping
+        ping_data = {
+            "attendance_id": active_session['_id'],
+            "employee_id": employee_id,
+            "tenant_id": tenant_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "location": {
+                "type": "Point",
+                "coordinates": [lng, lat]
+            }
+        }
+
+        db.location_pings.insert_one(ping_data)
+        return jsonify({"status": "Ping recorded"}), 200
+
+    except Exception as e:
+        app.logger.error(f"Unexpected error in /api/tracking/ping: {str(e)}")
+        return jsonify({"error": "Internal server error while processing ping."}), 500
+
+
+@app.route('/api/tracking/route/<attendance_id>', methods=['GET'])
+@token_required
+@team_required(['admin', 'hr_team', 'manager']) 
+def get_shift_route(attendance_id):
+    if client is None or db is None:
+        app.logger.critical("Database connection failure in get_shift_route")
+        return jsonify({"error": "Database connection not established."}), 500
+
+    current_emp_id = request.current_user.get('employee_id')
+    user_roles = request.current_user.get('role',[])
+    print("current_emp_id",current_emp_id)
+    print(user_roles)
+
+    try:
+        # 1. Fetch the shift record
+        try:
+            shift = attendance_collection.find_one({"_id": ObjectId(attendance_id)})
+        except Exception:
+            return jsonify({"message": "Invalid ID format"}), 400
+
+        if not shift:
+            return jsonify({"message": "Shift not found"}), 404
+
+        # 2. THE LOGIC CHECK
+        # Gate A: Is the user HR or Admin? (They get a "Pass")
+        # is_hr_or_admin = any(role in ['admin', 'hr_team'] for role in user_roles)
+        
+        # Gate B: If NOT HR/Admin, check if they are the SPECIFIC manager
+        if  user_roles=="admin":
+            target_emp = employees_collection.find_one(
+                {"employee_id": shift['employee_id'], "tenant_id": shift['tenant_id']}
+            )
+            
+            # # Check the matrix reporting array
+            # managers_list = target_emp.get('reports_to_employee_ids', [])
+            
+            # if current_emp_id not in managers_list:
+            #     app.logger.warning(f"Unauthorized tracking attempt: {current_emp_id} tried to view {shift['employee_id']}")
+            #     return jsonify({"message": "Access Denied: You do not manage this employee."}), 403
+
+        # 3. Fetch Pings and Construct Path
+        pings = list(db.location_pings.find({"attendance_id": ObjectId(attendance_id)}).sort("timestamp", 1))
+
+        path = []
+        # Start
+        path.append({
+            "time": shift['clock_in_time'], 
+            "lat": shift['location_in']['coordinates'][1], 
+            "lng": shift['location_in']['coordinates'][0], 
+            "type": "START"
+        })
+        
+        # Intermediate
+        for p in pings:
+            path.append({
+                "time": p['timestamp'], 
+                "lat": p['location']['coordinates'][1], 
+                "lng": p['location']['coordinates'][0], 
+                "type": "PING"
+            })
+        
+        # End
+        if shift.get('clock_out_time'):
+            path.append({
+                "time": shift['clock_out_time'], 
+                "lat": shift['location_out']['coordinates'][1], 
+                "lng": shift['location_out']['coordinates'][0], 
+                "type": "END"
+            })
+
+        return jsonify({"attendance_id": attendance_id, "route": path}), 200
+
+    except Exception as e:
+        app.logger.error(f"Critical error in /api/tracking/route: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

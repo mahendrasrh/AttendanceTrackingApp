@@ -1,0 +1,20 @@
+# add tenant id in the onboard tenant api
+# add old employee field 
+# nfc,face,finger print
+
+
+Many Snapdragon platforms, such as the Snapdragon 835, support the use of secure cameras with IR sensors for highly effective iris
+and facial recognition, even in low-light conditions.
+This technology uses infrared light patterns to map 3D depth and verify "liveness" to prevent spoofing with photos or masks.
+
+Yes, the Qualcomm Snapdragon 835 mobile platform fully supports NFC (Near Field Communication) as a built-in feature,
+making it available for contactless payments, quick data sharing, 
+and other short-range wireless interactions in devices powered by this chip, as confirmed by Qualcomm's official specifications. 
+
+Yes, the Qualcomm Snapdragon 835 absolutely supports fingerprint sensors, integrating with Qualcomm's 
+Haven security platform for robust biometric authentication, including fingerprint, iris, 
+and face recognition, making it a key feature in many flagship phones from that era like the Pixel 2 and OnePlus 5. 
+
+
+
+
